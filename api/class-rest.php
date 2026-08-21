@@ -14,8 +14,16 @@ class REST {
         register_rest_route('psc/v1','/courses',['methods'=>'GET','callback'=>[self::class,'courses'],'permission_callback'=>'__return_true']);
         register_rest_route('psc/v1','/courses/(?P<id>\d+)',['methods'=>'GET','callback'=>[self::class,'course'],'permission_callback'=>'__return_true']);
         register_rest_route('psc/v1','/subjects',['methods'=>'GET','callback'=>[self::class,'subjects'],'permission_callback'=>'__return_true']);
+        // Public question reading remains available for published questions.
+        // Admin mutations are protected by Firebase + WordPress admin capability.
         register_rest_route('psc/v1','/questions',['methods'=>'GET','callback'=>[self::class,'questions'],'permission_callback'=>'__return_true']);
+        register_rest_route('psc/v1','/questions',['methods'=>'POST','callback'=>[self::class,'create_question'],'permission_callback'=>[self::class,'require_admin_firebase']]);
         register_rest_route('psc/v1','/questions/(?P<id>\d+)',['methods'=>'GET','callback'=>[self::class,'question'],'permission_callback'=>'__return_true']);
+        register_rest_route('psc/v1','/questions/(?P<id>\d+)',['methods'=>'PUT, PATCH','callback'=>[self::class,'update_question'],'permission_callback'=>[self::class,'require_admin_firebase']]);
+        register_rest_route('psc/v1','/questions/(?P<id>\d+)',['methods'=>'DELETE','callback'=>[self::class,'delete_question_api'],'permission_callback'=>[self::class,'require_admin_firebase']]);
+        register_rest_route('psc/v1','/questions/bulk-delete',['methods'=>'POST','callback'=>[self::class,'bulk_delete_questions'],'permission_callback'=>[self::class,'require_admin_firebase']]);
+        register_rest_route('psc/v1','/questions/import',['methods'=>'POST','callback'=>[self::class,'import_questions_json_api'],'permission_callback'=>[self::class,'require_admin_firebase']]);
+        register_rest_route('psc/v1','/questions/admin',['methods'=>'GET','callback'=>[self::class,'admin_questions'],'permission_callback'=>[self::class,'require_admin_firebase']]);
         register_rest_route('psc/v1','/exams',['methods'=>'GET','callback'=>[self::class,'exams'],'permission_callback'=>'__return_true']);
         register_rest_route('psc/v1','/exams/(?P<id>\d+)',['methods'=>'GET','callback'=>[self::class,'exam'],'permission_callback'=>'__return_true']);
         register_rest_route('psc/v1','/exams/(?P<id>\d+)/submit',['methods'=>'POST','callback'=>[self::class,'submit_exam'],'permission_callback'=>[self::class,'require_firebase_user']]);
@@ -495,7 +503,169 @@ if($uid){$pr=$wpdb->get_row($wpdb->prepare("SELECT progress_percent,completed,la
         return $out;
     }
 
-    public static function questions():array{global $wpdb;$p=$wpdb->prefix;$rows=$wpdb->get_results("SELECT q.*,s.name subject,t.name topic FROM {$p}psc_questions q LEFT JOIN {$p}psc_subjects s ON s.id=q.subject_id LEFT JOIN {$p}psc_topics t ON t.id=q.topic_id WHERE q.status='published' ORDER BY q.id DESC",ARRAY_A);$data=[];foreach($rows as $q)$data[]=self::question_payload($q);return ['success'=>true,'data'=>$data];}
+    private static function question_write_payload($request): array {
+        $body = $request->get_json_params();
+        if (!is_array($body)) $body = [];
+        $question = wp_kses_post((string)($body['question'] ?? $body['question_text'] ?? ''));
+        $options_raw = $body['options'] ?? [];
+        $options = [];
+        if (is_array($options_raw)) {
+            foreach ($options_raw as $key => $value) {
+                if (is_array($value)) {
+                    $k = strtoupper((string)($value['key'] ?? $value['option'] ?? $key));
+                    $text = (string)($value['text'] ?? $value['option_text'] ?? '');
+                } else {
+                    $k = strtoupper((string)$key);
+                    $text = (string)$value;
+                }
+                $k = preg_replace('/[^A-E]/', '', $k);
+                if ($k && trim(wp_strip_all_tags($text)) !== '') $options[$k] = wp_kses_post($text);
+            }
+        }
+        if ($question === '') return new \WP_Error('question_required','Question text is required.',['status'=>400]);
+        if (count($options) < 2) return new \WP_Error('options_required','At least two options are required.',['status'=>400]);
+
+        $correct_raw = $body['correct_answer'] ?? $body['correct'] ?? null;
+        $correct = [];
+        if (is_string($correct_raw) && trim($correct_raw) !== '') $correct = [strtoupper(trim($correct_raw))];
+        elseif (is_array($correct_raw)) $correct = array_map('strtoupper', array_map('strval', $correct_raw));
+        $correct = array_values(array_intersect($correct, array_keys($options)));
+
+        $difficulty = sanitize_key((string)($body['difficulty'] ?? 'medium'));
+        if (!in_array($difficulty,['easy','medium','hard'],true)) $difficulty='medium';
+        $type = sanitize_key((string)($body['question_type'] ?? (count($correct)>1?'multiple':'single')));
+        if (!in_array($type,['single','multiple'],true)) $type=count($correct)>1?'multiple':'single';
+        $status = sanitize_key((string)($body['status'] ?? 'draft'));
+        if (!in_array($status,['draft','published'],true)) $status='draft';
+
+        return [
+            'question'=>$question,
+            'options'=>$options,
+            'correct'=>$correct,
+            'subject_id'=>absint($body['subject_id'] ?? 0) ?: null,
+            'topic_id'=>absint($body['topic_id'] ?? 0) ?: null,
+            'question_type'=>$type,
+            'difficulty'=>$difficulty,
+            'explanation'=>wp_kses_post((string)($body['explanation'] ?? '')),
+            'source'=>sanitize_text_field((string)($body['source'] ?? '')),
+            'source_question_number'=>sanitize_text_field((string)($body['question_number'] ?? $body['source_question_number'] ?? '')),
+            'exam_year'=>sanitize_text_field((string)($body['exam_year'] ?? $body['year'] ?? '')),
+            'status'=>$status,
+            'language'=>sanitize_text_field((string)($body['language'] ?? 'ml')),
+            'facts'=>array_values(array_filter(array_map(static fn($v)=>wp_kses_post((string)$v),(array)($body['facts'] ?? [])),static fn($v)=>trim(wp_strip_all_tags($v))!=='')),
+        ];
+    }
+
+    private static function persist_question(array $data, int $id=0): int|\WP_Error {
+        global $wpdb; $p=$wpdb->prefix; $now=current_time('mysql');
+        $row=[
+            'subject_id'=>$data['subject_id'],'topic_id'=>$data['topic_id'],'question'=>$data['question'],
+            'question_pdf_attachment_id'=>null,'question_type'=>$data['question_type'],'difficulty'=>$data['difficulty'],
+            'explanation'=>$data['explanation'],'source'=>$data['source'],'source_question_number'=>$data['source_question_number'],
+            'exam_year'=>$data['exam_year'],'status'=>$data['status'],'updated_at'=>$now
+        ];
+        if($id){
+            if(!$wpdb->get_var($wpdb->prepare("SELECT id FROM {$p}psc_questions WHERE id=%d",$id))) return new \WP_Error('question_not_found','Question not found.',['status'=>404]);
+            $ok=$wpdb->update($p.'psc_questions',$row,['id'=>$id]);
+        } else {
+            $row['created_at']=$now; $ok=$wpdb->insert($p.'psc_questions',$row); $id=(int)$wpdb->insert_id;
+        }
+        if($ok===false || !$id) return new \WP_Error('question_save_failed','Unable to save the question.',['status'=>500]);
+
+        $wpdb->delete($p.'psc_question_options',['question_id'=>$id],['%d']);
+        foreach($data['options'] as $key=>$text){
+            if(false===$wpdb->insert($p.'psc_question_options',['question_id'=>$id,'option_key'=>$key,'option_text'=>$text,'is_correct'=>in_array($key,$data['correct'],true)?1:0,'sort_order'=>ord($key)-65])) return new \WP_Error('option_save_failed','Unable to save one or more options.',['status'=>500]);
+        }
+        $wpdb->delete($p.'psc_question_facts',['question_id'=>$id],['%d']);
+        foreach($data['facts'] as $i=>$fact) $wpdb->insert($p.'psc_question_facts',['question_id'=>$id,'fact'=>$fact,'sort_order'=>$i]);
+        return $id;
+    }
+
+    public static function create_question($request){
+        $data=self::question_write_payload($request); if(is_wp_error($data)) return $data;
+        $id=self::persist_question($data); if(is_wp_error($id)) return $id;
+        return ['success'=>true,'data'=>self::admin_question_payload((int)$id)];
+    }
+
+    public static function update_question($request){
+        $data=self::question_write_payload($request); if(is_wp_error($data)) return $data;
+        $id=self::persist_question($data,absint($request['id'])); if(is_wp_error($id)) return $id;
+        return ['success'=>true,'data'=>self::admin_question_payload((int)$id)];
+    }
+
+    public static function delete_question_api($request){
+        global $wpdb; $p=$wpdb->prefix; $id=absint($request['id']);
+        if(!$wpdb->get_var($wpdb->prepare("SELECT id FROM {$p}psc_questions WHERE id=%d",$id))) return new \WP_Error('question_not_found','Question not found.',['status'=>404]);
+        $wpdb->delete($p.'psc_exam_questions',['question_id'=>$id],['%d']);
+        $wpdb->delete($p.'psc_question_options',['question_id'=>$id],['%d']);
+        $wpdb->delete($p.'psc_question_facts',['question_id'=>$id],['%d']);
+        $wpdb->delete($p.'psc_questions',['id'=>$id],['%d']);
+        return ['success'=>true,'deleted_ids'=>[$id]];
+    }
+
+    public static function bulk_delete_questions($request){
+        global $wpdb; $p=$wpdb->prefix; $body=$request->get_json_params(); $ids=array_values(array_unique(array_filter(array_map('absint',(array)($body['ids']??$body['question_ids']??[])))));
+        if(!$ids) return new \WP_Error('ids_required','At least one question ID is required.',['status'=>400]);
+        $deleted=[];
+        foreach($ids as $id){
+            if(!$wpdb->get_var($wpdb->prepare("SELECT id FROM {$p}psc_questions WHERE id=%d",$id))) continue;
+            $wpdb->delete($p.'psc_exam_questions',['question_id'=>$id],['%d']);
+            $wpdb->delete($p.'psc_question_options',['question_id'=>$id],['%d']);
+            $wpdb->delete($p.'psc_question_facts',['question_id'=>$id],['%d']);
+            $wpdb->delete($p.'psc_questions',['id'=>$id],['%d']); $deleted[]=$id;
+        }
+        return ['success'=>true,'deleted_ids'=>$deleted,'deleted_count'=>count($deleted)];
+    }
+
+    public static function import_questions_json_api($request){
+        $body=$request->get_json_params(); if(!is_array($body)) return new \WP_Error('invalid_json','JSON body must be an object containing a questions array.',['status'=>400]);
+        $items=$body['questions']??$body['data']??$body;
+        if(!is_array($items) || !array_is_list($items)) return new \WP_Error('invalid_questions','questions must be an array of question objects.',['status'=>400]);
+        if(count($items)>5000) return new \WP_Error('too_many_questions','Maximum 5,000 questions per import.',['status'=>413]);
+        $imported=0;$skipped=0;$errors=[];
+        foreach($items as $i=>$item){
+            if(!is_array($item)){ $skipped++; $errors[]=['index'=>$i,'message'=>'Question item is not an object.']; continue; }
+            $r=new \WP_REST_Request('POST','/psc/v1/questions'); $r->set_body(wp_json_encode($item)); $r->set_header('Content-Type','application/json');
+            $data=self::question_write_payload($r); if(is_wp_error($data)){ $skipped++; $errors[]=['index'=>$i,'message'=>$data->get_error_message()]; continue; }
+            // Skip exact normalized duplicates.
+            global $wpdb; $p=$wpdb->prefix; $normalized=strtolower(preg_replace('/\s+/',' ',wp_strip_all_tags($data['question'])));
+            $duplicate=(int)$wpdb->get_var($wpdb->prepare("SELECT id FROM {$p}psc_questions WHERE LOWER(REPLACE(REPLACE(question,'\\n',' '),'  ',' '))=%s LIMIT 1",$normalized));
+            if($duplicate){$skipped++;$errors[]=['index'=>$i,'message'=>'Duplicate question','existing_id'=>$duplicate];continue;}
+            $id=self::persist_question($data); if(is_wp_error($id)){ $skipped++; $errors[]=['index'=>$i,'message'=>$id->get_error_message()]; continue; }
+            $imported++;
+        }
+        return ['success'=>true,'imported'=>$imported,'skipped'=>$skipped,'errors'=>$errors];
+    }
+
+    private static function admin_question_payload(int $id): array {
+        global $wpdb;$p=$wpdb->prefix;
+        $q=$wpdb->get_row($wpdb->prepare("SELECT q.*,s.name subject,t.name topic FROM {$p}psc_questions q LEFT JOIN {$p}psc_subjects s ON s.id=q.subject_id LEFT JOIN {$p}psc_topics t ON t.id=q.topic_id WHERE q.id=%d",$id),ARRAY_A);
+        if(!$q) return [];
+        $out=self::question_payload($q); $out['status']=$q['status']; $out['language']=$q['language']??'ml'; $out['correct_answer']=null;
+        $correct=[]; foreach($out['options'] as $o) if($o['is_correct']) $correct[]=$o['option_code']; $out['correct_answer']=count($correct)>1?$correct:($correct[0]??null);
+        return $out;
+    }
+
+    public static function admin_questions($request){
+        global $wpdb;$p=$wpdb->prefix;
+        $page=max(1,absint($request->get_param('page')??1)); $per=min(100,max(1,absint($request->get_param('per_page')??25))); $search=sanitize_text_field((string)$request->get_param('search'));
+        $where='1=1';$params=[];
+        if($search!==''){ $like='%'.$wpdb->esc_like($search).'%'; $where.=' AND q.question LIKE %s';$params[]=$like; }
+        $count_sql="SELECT COUNT(*) FROM {$p}psc_questions q WHERE {$where}"; $total=(int)$wpdb->get_var($params?$wpdb->prepare($count_sql,...$params):$count_sql);
+        $offset=($page-1)*$per; $sql="SELECT q.*,s.name subject,t.name topic FROM {$p}psc_questions q LEFT JOIN {$p}psc_subjects s ON s.id=q.subject_id LEFT JOIN {$p}psc_topics t ON t.id=q.topic_id WHERE {$where} ORDER BY q.id DESC LIMIT %d OFFSET %d"; $params[]=$per;$params[]=$offset;
+        $rows=$wpdb->get_results($wpdb->prepare($sql,...$params),ARRAY_A);$data=[];foreach($rows as $q)$data[]=self::admin_question_payload((int)$q['id']);
+        return ['success'=>true,'data'=>$data,'pagination'=>['page'=>$page,'per_page'=>$per,'total'=>$total,'total_pages'=>max(1,(int)ceil($total/$per))]];
+    }
+
+    public static function questions($request=null):array{
+        global $wpdb;$p=$wpdb->prefix;
+        $page=max(1,absint($request instanceof \WP_REST_Request ? $request->get_param('page') : 1));
+        $per=min(100,max(1,absint($request instanceof \WP_REST_Request ? $request->get_param('per_page') : 100)));
+        $offset=($page-1)*$per;
+        $rows=$wpdb->get_results($wpdb->prepare("SELECT q.*,s.name subject,t.name topic FROM {$p}psc_questions q LEFT JOIN {$p}psc_subjects s ON s.id=q.subject_id LEFT JOIN {$p}psc_topics t ON t.id=q.topic_id WHERE q.status='published' ORDER BY q.id DESC LIMIT %d OFFSET %d",$per,$offset),ARRAY_A);
+        $data=[];foreach($rows as $q)$data[]=self::question_payload($q);
+        return ['success'=>true,'data'=>$data,'pagination'=>['page'=>$page,'per_page'=>$per,'returned'=>count($data)]];
+    }
     public static function question($request):array{global $wpdb;$q=$wpdb->get_row($wpdb->prepare("SELECT q.*,s.name subject,t.name topic FROM {$wpdb->prefix}psc_questions q LEFT JOIN {$wpdb->prefix}psc_subjects s ON s.id=q.subject_id LEFT JOIN {$wpdb->prefix}psc_topics t ON t.id=q.topic_id WHERE q.id=%d AND q.status='published'",absint($request['id'])),ARRAY_A);if(!$q)return ['success'=>false,'message'=>'Question not found'];return ['success'=>true,'data'=>self::question_payload($q)];}
 
     public static function exams():array{global $wpdb;$p=$wpdb->prefix;$rows=$wpdb->get_results("SELECT id,title,description,duration_minutes,total_marks,negative_mark,passing_percentage,max_attempts,shuffle_questions,shuffle_options FROM {$p}psc_exams WHERE status='published' ORDER BY id DESC",ARRAY_A);foreach($rows as &$e){$e['questions']=[];foreach($wpdb->get_results($wpdb->prepare("SELECT eq.question_id,eq.marks,q.question FROM {$p}psc_exam_questions eq LEFT JOIN {$p}psc_questions q ON q.id=eq.question_id WHERE eq.exam_id=%d ORDER BY eq.sort_order",$e['id']),ARRAY_A) as $q){$full=$wpdb->get_row($wpdb->prepare("SELECT q.*,s.name subject,t.name topic FROM {$p}psc_questions q LEFT JOIN {$p}psc_subjects s ON s.id=q.subject_id LEFT JOIN {$p}psc_topics t ON t.id=q.topic_id WHERE q.id=%d",(int)$q['question_id']),ARRAY_A);if($full)$e['questions'][]=array_merge(self::question_payload($full),['marks'=>(float)$q['marks']]);}$e['total_questions']=count($e['questions']);$e['marks_per_question']=(float)($e['total_questions']?($e['total_marks']/$e['total_questions']):1);$e['negative_marks']=(float)$e['negative_mark'];$e['passing_score_percent']=(float)$e['passing_percentage'];}

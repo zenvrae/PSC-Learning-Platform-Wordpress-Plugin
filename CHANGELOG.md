@@ -1,3 +1,14 @@
+# PSC LMS 3.1.9
+
+## Question REST API
+- Added authenticated admin REST endpoints for question create, update, delete, bulk delete, JSON import, and paginated admin listing.
+- Kept public question GET endpoints limited to published questions.
+- Added UTF-8/Unicode-safe JSON import through REST.
+- Added duplicate-question protection during API import.
+- Question mutations require Firebase authentication plus WordPress `manage_options`; no public write endpoints.
+- Bulk deletion also removes exam-question links, options, and related facts.
+- Existing WordPress admin JSON importer, pagination, and bulk-delete UI remain available.
+
 # PSC LMS 3.1.8
 
 ## JSON import critical-error hotfix

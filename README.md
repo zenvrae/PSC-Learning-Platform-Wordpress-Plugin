@@ -24,3 +24,17 @@ The Question Bank now supports selecting multiple questions with checkboxes, Sel
 
 ### PDF / DOCX Question Import
 Upload text-based PDF or DOCX Word files. PDF extraction uses the embedded text layer by default; OCR and AI are optional. PSC two-column option markers are normalized by position, and imports are blocked when a document explicitly declares 100 questions but fewer are detected.
+
+## Question REST API
+
+Admin clients can use the following authenticated endpoints with a Firebase bearer token belonging to a WordPress administrator:
+
+- `GET /wp-json/psc/v1/questions?page=1&per_page=25` — published questions for learners.
+- `GET /wp-json/psc/v1/questions/admin?page=1&per_page=25&search=...` — full admin question list including drafts.
+- `POST /wp-json/psc/v1/questions` — create a question.
+- `PUT/PATCH /wp-json/psc/v1/questions/{id}` — update a question.
+- `DELETE /wp-json/psc/v1/questions/{id}` — delete a question and related records.
+- `POST /wp-json/psc/v1/questions/bulk-delete` with `{ "ids": [1,2,3] }` — bulk delete.
+- `POST /wp-json/psc/v1/questions/import` with `{ "questions": [...] }` — JSON import; `correct_answer` may be omitted or null.
+
+Question write endpoints are protected by Firebase authentication and the WordPress `manage_options` capability.
