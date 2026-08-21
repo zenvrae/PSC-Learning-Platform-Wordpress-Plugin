@@ -11,6 +11,7 @@ class Questions_Admin
         add_action('admin_post_psc_delete_question', [self::class, 'delete']);
         add_action('admin_post_psc_bulk_question_action', [self::class, 'bulk_action']);
         add_action('admin_post_psc_import_questions_pdf', [self::class, 'import_pdf']);
+        add_action('admin_post_psc_import_questions_json', [self::class, 'import_json']);
     }
 
     private static function url(array $args = []): string
@@ -33,21 +34,34 @@ class Questions_Admin
             self::import_form();
             return;
         }
+        if ($action === 'import_json') {
+            self::json_import_form();
+            return;
+        }
 
         global $wpdb;
         $p = $wpdb->prefix;
 
-        $rows = $wpdb->get_results(
+        $per_page = 25;
+        $current_page = max(1, absint($_GET['paged'] ?? 1));
+        $total_questions = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$p}psc_questions");
+        $total_pages = max(1, (int)ceil($total_questions / $per_page));
+        $current_page = min($current_page, $total_pages);
+        $offset = ($current_page - 1) * $per_page;
+        $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT q.*, s.name subject, t.name topic
              FROM {$p}psc_questions q
              LEFT JOIN {$p}psc_subjects s ON s.id=q.subject_id
              LEFT JOIN {$p}psc_topics t ON t.id=q.topic_id
-             ORDER BY q.id DESC"
-        );
+             ORDER BY q.id DESC
+             LIMIT %d OFFSET %d",
+            $per_page, $offset
+        ));
 
         echo '<div class="wrap"><h1>Question Bank
             <a class="page-title-action" href="' . esc_url(self::url(['action' => 'new'])) . '">Add New</a>
             <a class="page-title-action" href="' . esc_url(self::url(['action' => 'import_pdf'])) . '">Import Questions from PDF / Word</a>
+            <a class="page-title-action" href="' . esc_url(self::url(['action' => 'import_json'])) . '">Import Questions from JSON</a>
         </h1>';
 
         if (isset($_GET['saved'])) {
@@ -61,7 +75,7 @@ class Questions_Admin
         }
         if (isset($_GET['imported'])) {
             $exam = sanitize_text_field(wp_unslash($_GET['exam'] ?? ''));
-            echo '<div class="notice notice-success"><p>Imported ' . absint($_GET['imported']) . ' question(s). Skipped ' . absint($_GET['skipped'] ?? 0) . ' item(s).' .
+            echo '<div class="notice notice-success"><p>' . (sanitize_key($_GET['import_type'] ?? '') === 'json' ? 'JSON import: ' : '') . 'Imported ' . absint($_GET['imported']) . ' question(s). Skipped ' . absint($_GET['skipped'] ?? 0) . ' item(s).' .
                 ($exam ? ' Exam created: <strong>' . esc_html($exam) . '</strong>.' : '') .
                 '</p></div>';
         }
@@ -128,6 +142,20 @@ class Questions_Admin
         }
 
         echo '</tbody></table>';
+        if ($total_pages > 1) {
+            echo '<div style="margin:16px 0;">';
+            echo '<span style="margin-right:10px;color:#50575e;">Page '.esc_html($current_page).' of '.esc_html($total_pages).' — '.esc_html($total_questions).' questions</span>';
+            echo paginate_links([
+                'base' => esc_url_raw(self::url(['paged'=>'%#%'])),
+                'format' => '',
+                'current' => $current_page,
+                'total' => $total_pages,
+                'type' => 'plain',
+                'prev_text' => '‹ Previous',
+                'next_text' => 'Next ›',
+            ]);
+            echo '</div>';
+        }
         echo '<div style="margin-top:10px;display:flex;align-items:center;gap:8px;">';
         echo '<span id="psc-selected-count-bottom" style="color:#50575e;">0 selected</span>';
         echo '</div>';
@@ -418,6 +446,132 @@ class Questions_Admin
         }
 
         wp_safe_redirect(self::url());
+        exit;
+    }
+
+    private static function json_import_form(): void
+    {
+        echo '<div class="wrap"><h1>Import Questions from JSON</h1>';
+        echo '<p><a href="'.esc_url(self::url()).'">← Back to Questions</a></p>';
+        echo '<div style="background:#fff;border:1px solid #ddd;padding:24px;max-width:1000px;">';
+        echo '<h2>JSON → Question Bank</h2>';
+        echo '<p>Upload a UTF-8 JSON file containing an array of question objects. Correct answers are optional; when omitted or null, the question is imported with no correct answer so the admin can set it later.</p>';
+        echo '<pre style="background:#f6f7f7;padding:12px;overflow:auto;">'.esc_html(json_encode([
+            ['question'=>'താഴെ പറയുന്നവയിൽ ഹിമാലയ പർവ്വതനിരയുടെ സവിശേഷത ഏത്?','options'=>['A'=>'കിഴക്കോട്ടുപോകുന്തോറും ഉയരം കൂടുന്നു.','B'=>'പടിഞ്ഞാറ് ഭാഗത്ത് ഉയരം ഏറ്റവും കുറവ്.','C'=>'കിഴക്കോട്ടുപോകുന്തോറും ഉയരം കുറയുന്നു.','D'=>'എല്ലാ ഭാഗത്തും ഒരേ ഉയരം.'],'correct_answer'=>null]
+        ], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE)).'</pre>';
+        echo '<form method="post" action="'.esc_url(admin_url('admin-post.php')).'" enctype="multipart/form-data">';
+        wp_nonce_field('psc_import_questions_json');
+        echo '<input type="hidden" name="action" value="psc_import_questions_json">';
+        echo '<p><label><strong>JSON file (.json)</strong><br><input type="file" name="question_json" accept="application/json,.json" required></label></p>';
+        echo '<p><label>Subject ID <input type="number" name="subject_id" min="0" value="0"></label> ';
+        echo '<label>Topic ID <input type="number" name="topic_id" min="0" value="0"></label> ';
+        echo '<label>Difficulty <select name="difficulty"><option value="easy">Easy</option><option value="medium" selected>Medium</option><option value="hard">Hard</option></select></label> ';
+        echo '<label>Language <input name="language" value="ml" style="width:120px"></label></p>';
+        echo '<p><label>Source <input name="source" style="width:300px" placeholder="e.g. VFA 137/2017"></label> ';
+        echo '<label>Exam Year <input name="exam_year" style="width:90px"></label> ';
+        echo '<label><input type="checkbox" name="publish" value="1"> Publish imported questions</label></p>';
+        echo '<p><button class="button button-primary button-large">Validate & Import JSON</button></p>';
+        echo '</form></div></div>';
+    }
+
+    public static function import_json(): void
+    {
+        if (!current_user_can('manage_options') || !check_admin_referer('psc_import_questions_json')) wp_die('Access denied.');
+        if (empty($_FILES['question_json']['tmp_name'])) wp_die('JSON file is required.');
+
+        $file = $_FILES['question_json'];
+        $ext = strtolower(pathinfo($file['name'] ?? '', PATHINFO_EXTENSION));
+        if ($ext !== 'json') wp_die('Only .json files are allowed.');
+        if (!empty($file['error'])) wp_die('The JSON upload failed.');
+        if ((int)$file['size'] > 10 * 1024 * 1024) wp_die('JSON file is too large. Maximum size is 10 MB.');
+
+        $raw = file_get_contents($file['tmp_name']);
+        if ($raw === false || $raw === '') wp_die('Could not read the JSON file.');
+        // UTF-8 BOM is harmless but must be removed before json_decode.
+        $raw = preg_replace('/^\xEF\xBB\xBF/', '', $raw);
+        $items = json_decode($raw, true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($items) || !array_is_list($items)) {
+            wp_die('Invalid JSON. The root value must be an array of question objects. JSON error: '.esc_html(json_last_error_msg()));
+        }
+        if (count($items) > 5000) wp_die('Maximum 5,000 questions per import.');
+
+        global $wpdb;
+        $p = $wpdb->prefix;
+        $subject_id = absint($_POST['subject_id'] ?? 0) ?: null;
+        $topic_id = absint($_POST['topic_id'] ?? 0) ?: null;
+        $difficulty = in_array($_POST['difficulty'] ?? 'medium', ['easy','medium','hard'], true) ? $_POST['difficulty'] : 'medium';
+        $source = sanitize_text_field(wp_unslash($_POST['source'] ?? ''));
+        $year = sanitize_text_field(wp_unslash($_POST['exam_year'] ?? ''));
+        $language = sanitize_text_field(wp_unslash($_POST['language'] ?? 'ml'));
+        $publish = !empty($_POST['publish']);
+        $now = current_time('mysql');
+        $imported = 0;
+        $skipped = 0;
+
+        foreach ($items as $index => $item) {
+            if (!is_array($item)) { $skipped++; continue; }
+            $question = wp_kses_post((string)($item['question'] ?? $item['question_text'] ?? ''));
+            $options_raw = $item['options'] ?? [];
+            $options = [];
+            if (is_array($options_raw)) {
+                foreach ($options_raw as $key => $value) {
+                    if (is_array($value)) {
+                        $k = strtoupper((string)($value['key'] ?? $value['option'] ?? $key));
+                        $text = (string)($value['text'] ?? $value['option_text'] ?? '');
+                    } else {
+                        $k = strtoupper((string)$key);
+                        $text = (string)$value;
+                    }
+                    $k = preg_replace('/[^A-E]/', '', $k);
+                    if ($k && trim(wp_strip_all_tags($text)) !== '') $options[$k] = wp_kses_post($text);
+                }
+            }
+            if ($question === '' || count($options) < 2) { $skipped++; continue; }
+
+            $correct_raw = $item['correct_answer'] ?? $item['correct'] ?? null;
+            $correct = [];
+            if (is_string($correct_raw) && trim($correct_raw) !== '') $correct = [strtoupper(trim($correct_raw))];
+            elseif (is_array($correct_raw)) $correct = array_map('strtoupper', array_map('strval', $correct_raw));
+            $correct = array_values(array_intersect($correct, array_keys($options)));
+
+            $normalized = strtolower(preg_replace('/\s+/', ' ', wp_strip_all_tags($question)));
+            $duplicate = (int)$wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM {$p}psc_questions WHERE LOWER(REPLACE(REPLACE(question,'\\n',' '),'  ',' '))=%s LIMIT 1",
+                $normalized
+            ));
+            if ($duplicate) { $skipped++; continue; }
+
+            $data = [
+                'subject_id'=>$subject_id,
+                'topic_id'=>$topic_id,
+                'question'=>$question,
+                'question_pdf_attachment_id'=>null,
+                'question_type'=>count($correct)>1?'multiple':'single',
+                'difficulty'=>$difficulty,
+                'explanation'=>wp_kses_post((string)($item['explanation'] ?? '')),
+                'source'=>$source ?: sanitize_text_field((string)($item['source'] ?? '')),
+                'source_question_number'=>sanitize_text_field((string)($item['question_number'] ?? $item['number'] ?? ($index+1))),
+                'exam_year'=>$year ?: sanitize_text_field((string)($item['exam_year'] ?? '')),
+                'status'=>$publish?'published':'draft',
+                'created_at'=>$now,
+                'updated_at'=>$now
+            ];
+            if (!$wpdb->insert($p.'psc_questions',$data)) { $skipped++; continue; }
+            $qid=(int)$wpdb->insert_id;
+            $sort=0;
+            foreach ($options as $key=>$text) {
+                $wpdb->insert($p.'psc_question_options',[
+                    'question_id'=>$qid,'option_key'=>$key,'option_text'=>$text,
+                    'is_correct'=>in_array($key,$correct,true)?1:0,'sort_order'=>$sort++
+                ]);
+            }
+            if (!empty($data['explanation'])) {
+                $wpdb->insert($p.'psc_question_facts',['question_id'=>$qid,'fact'=>$data['explanation'],'sort_order'=>0]);
+            }
+            $imported++;
+        }
+
+        wp_safe_redirect(self::url(['imported'=>$imported,'skipped'=>$skipped,'import_type'=>'json']));
         exit;
     }
 

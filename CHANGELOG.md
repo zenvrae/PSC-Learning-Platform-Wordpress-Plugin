@@ -1,3 +1,24 @@
+# PSC LMS 3.1.8
+
+## JSON import critical-error hotfix
+
+- Fixed a PHP runtime fatal error on the JSON import screen caused by a Python-style `None` literal in generated PHP.
+- JSON import page now renders normally.
+- JSON import accepts UTF-8 JSON arrays, optional correct answers, Malayalam Unicode, and the existing question schema.
+- Existing pagination and bulk-delete features remain unchanged.
+
+# PSC LMS 3.1.7
+
+## Question bank improvements
+
+- Added WordPress admin JSON question import for UTF-8/Unicode question arrays.
+- Supports `question`, `question_text`, `options`, `correct_answer`, `correct`, `explanation`, `source`, `question_number`, `number`, and `exam_year`.
+- `correct_answer: null` is allowed; imported questions remain without a correct answer for later admin selection.
+- Added paginated Question Bank (25 questions per page).
+- Existing bulk delete is retained and securely deletes selected questions and related options/facts/exam links.
+- JSON imports are capped at 5,000 questions and 10 MB per file.
+- UTF-8 BOM is handled and Unicode Malayalam is preserved.
+
 # PSC LMS 3.1.6
 
 ## Onboarding profile save reliability
