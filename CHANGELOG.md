@@ -1,3 +1,14 @@
+# PSC LMS 3.2.0
+
+## Exam CRUD API
+
+- Added protected REST API endpoints for creating, updating, deleting, and bulk deleting exams.
+- Exam mutations require Firebase authentication plus WordPress administrator capability.
+- Supports exam question assignment through `question_ids` or `questions`.
+- Updates and deletes preserve the existing published exam read/submit APIs.
+- Deletes related exam-question assignments and exam attempts before deleting the exam.
+- No changes to student/onboarding APIs.
+
 # PSC LMS 3.1.9
 
 ## Question REST API
