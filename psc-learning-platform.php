@@ -2,14 +2,14 @@
 /**
  * Plugin Name: PSC Learning Platform
  * Description: PSC LMS backend with complete admin content management, progress tracking and Next.js REST API.
- * Version: 3.2.0
+ * Version: 3.2.1
  * Author: PSC Learning Platform
  * Requires at least: 6.4
  * Requires PHP: 8.1
  */
 if (!defined('ABSPATH')) exit;
 
-define('PSC_LMS_VERSION', '3.2.0');
+define('PSC_LMS_VERSION', '3.2.1');
 define('PSC_LMS_FILE', __FILE__);
 define('PSC_LMS_DIR', plugin_dir_path(__FILE__));
 define('PSC_LMS_URL', plugin_dir_url(__FILE__));

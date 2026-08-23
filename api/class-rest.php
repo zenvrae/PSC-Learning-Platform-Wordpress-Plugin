@@ -25,7 +25,11 @@ class REST {
         register_rest_route('psc/v1','/questions/import',['methods'=>'POST','callback'=>[self::class,'import_questions_json_api'],'permission_callback'=>[self::class,'require_admin_firebase']]);
         register_rest_route('psc/v1','/questions/admin',['methods'=>'GET','callback'=>[self::class,'admin_questions'],'permission_callback'=>[self::class,'require_admin_firebase']]);
         register_rest_route('psc/v1','/exams',['methods'=>'GET','callback'=>[self::class,'exams'],'permission_callback'=>'__return_true']);
+        register_rest_route('psc/v1','/exams',['methods'=>'POST','callback'=>[self::class,'create_exam'],'permission_callback'=>[self::class,'require_admin_firebase']]);
         register_rest_route('psc/v1','/exams/(?P<id>\d+)',['methods'=>'GET','callback'=>[self::class,'exam'],'permission_callback'=>'__return_true']);
+        register_rest_route('psc/v1','/exams/(?P<id>\d+)',['methods'=>'PUT, PATCH','callback'=>[self::class,'update_exam'],'permission_callback'=>[self::class,'require_admin_firebase']]);
+        register_rest_route('psc/v1','/exams/(?P<id>\d+)',['methods'=>'DELETE','callback'=>[self::class,'delete_exam_api'],'permission_callback'=>[self::class,'require_admin_firebase']]);
+        register_rest_route('psc/v1','/exams/bulk-delete',['methods'=>'POST','callback'=>[self::class,'bulk_delete_exams_api'],'permission_callback'=>[self::class,'require_admin_firebase']]);
         register_rest_route('psc/v1','/exams/(?P<id>\d+)/submit',['methods'=>'POST','callback'=>[self::class,'submit_exam'],'permission_callback'=>[self::class,'require_firebase_user']]);
         register_rest_route('psc/v1','/attempts/(?P<id>\d+)',['methods'=>'GET','callback'=>[self::class,'attempt'],'permission_callback'=>[self::class,'require_firebase_user']]);
         register_rest_route('psc/v1','/lessons/(?P<id>\d+)/view',['methods'=>'POST','callback'=>[self::class,'mark_lesson_viewed'],'permission_callback'=>[self::class,'require_firebase_user']]);
@@ -671,6 +675,64 @@ if($uid){$pr=$wpdb->get_row($wpdb->prepare("SELECT progress_percent,completed,la
     public static function exams():array{global $wpdb;$p=$wpdb->prefix;$rows=$wpdb->get_results("SELECT id,title,description,duration_minutes,total_marks,negative_mark,passing_percentage,max_attempts,shuffle_questions,shuffle_options FROM {$p}psc_exams WHERE status='published' ORDER BY id DESC",ARRAY_A);foreach($rows as &$e){$e['questions']=[];foreach($wpdb->get_results($wpdb->prepare("SELECT eq.question_id,eq.marks,q.question FROM {$p}psc_exam_questions eq LEFT JOIN {$p}psc_questions q ON q.id=eq.question_id WHERE eq.exam_id=%d ORDER BY eq.sort_order",$e['id']),ARRAY_A) as $q){$full=$wpdb->get_row($wpdb->prepare("SELECT q.*,s.name subject,t.name topic FROM {$p}psc_questions q LEFT JOIN {$p}psc_subjects s ON s.id=q.subject_id LEFT JOIN {$p}psc_topics t ON t.id=q.topic_id WHERE q.id=%d",(int)$q['question_id']),ARRAY_A);if($full)$e['questions'][]=array_merge(self::question_payload($full),['marks'=>(float)$q['marks']]);}$e['total_questions']=count($e['questions']);$e['marks_per_question']=(float)($e['total_questions']?($e['total_marks']/$e['total_questions']):1);$e['negative_marks']=(float)$e['negative_mark'];$e['passing_score_percent']=(float)$e['passing_percentage'];}
         return ['success'=>true,'data'=>$rows];}
     public static function exam($request):array{$all=self::exams()['data'];foreach($all as $e)if((int)$e['id']===absint($request['id']))return ['success'=>true,'data'=>$e];return ['success'=>false,'message'=>'Exam not found'];}
+
+
+    private static function exam_admin_payload($request): array {
+        $body=$request->get_json_params(); if(!is_array($body)) $body=[];
+        $title=sanitize_text_field((string)($body['title']??$body['name']??''));
+        if($title==='') return ['error'=>new \WP_Error('exam_title_required','Exam title is required.',['status'=>400])];
+        $data=['title'=>$title];
+        if(array_key_exists('description',$body)) $data['description']=sanitize_textarea_field((string)$body['description']);
+        if(array_key_exists('duration_minutes',$body)) $data['duration_minutes']=max(1,absint($body['duration_minutes']));
+        if(array_key_exists('total_marks',$body)) $data['total_marks']=max(0,(float)$body['total_marks']);
+        if(array_key_exists('negative_marks',$body)) $data['negative_mark']=max(0,(float)$body['negative_marks']);
+        if(array_key_exists('negative_mark',$body)) $data['negative_mark']=max(0,(float)$body['negative_mark']);
+        if(array_key_exists('passing_percentage',$body)) $data['passing_percentage']=max(0,min(100,(float)$body['passing_percentage']));
+        if(array_key_exists('max_attempts',$body)) $data['max_attempts']=max(0,absint($body['max_attempts']));
+        foreach(['shuffle_questions','shuffle_options'] as $f) if(array_key_exists($f,$body)) $data[$f]=!empty($body[$f])?1:0;
+        if(array_key_exists('status',$body)) { $s=sanitize_key((string)$body['status']); if(!in_array($s,['draft','published','archived'],true)) return ['error'=>new \WP_Error('exam_status_invalid','Status must be draft, published, or archived.',['status'=>400])]; $data['status']=$s; }
+        $raw=$body['question_ids']??$body['questions']??[]; $questions=[];
+        if(is_array($raw)) foreach($raw as $i=>$q){ $qid=is_array($q)?absint($q['id']??$q['question_id']??0):absint($q); if($qid) $questions[]=['question_id'=>$qid,'marks'=>is_array($q)?max(0,(float)($q['marks']??1)):1,'sort_order'=>$i]; }
+        $data['_questions']=$questions;
+        return ['data'=>$data];
+    }
+
+    private static function sync_exam_questions_admin($exam_id,array $questions): bool {
+        global $wpdb; $table=$wpdb->prefix.'psc_exam_questions';
+        if($wpdb->delete($table,['exam_id'=>$exam_id],['%d'])===false) return false;
+        foreach($questions as $q) if($wpdb->insert($table,['exam_id'=>$exam_id,'question_id'=>$q['question_id'],'marks'=>$q['marks'],'sort_order'=>$q['sort_order']],['%d','%d','%f','%d'])===false) return false;
+        return true;
+    }
+
+    public static function create_exam($request){
+        global $wpdb; $parsed=self::exam_admin_payload($request); if(isset($parsed['error'])) return $parsed['error']; $d=$parsed['data']; $questions=$d['_questions']; unset($d['_questions']);
+        $d['status']=$d['status']??'draft'; $now=current_time('mysql'); $d['created_at']=$now; $d['updated_at']=$now;
+        if($d['total_marks']??null){} else $d['total_marks']=array_sum(array_column($questions,'marks'));
+        $table=$wpdb->prefix.'psc_exams'; if($wpdb->insert($table,$d,['%s','%s','%d','%f','%f','%f','%d','%d','%d','%s','%s'])===false) return new \WP_Error('exam_create_failed',$wpdb->last_error?:'Could not create exam.',['status'=>500]);
+        $id=(int)$wpdb->insert_id; if(!self::sync_exam_questions_admin($id,$questions)){ $wpdb->delete($table,['id'=>$id],['%d']); return new \WP_Error('exam_question_sync_failed',$wpdb->last_error?:'Could not save exam questions.',['status'=>500]); }
+        return ['success'=>true,'data'=>['id'=>$id],'message'=>'Exam created successfully.'];
+    }
+
+    public static function update_exam($request){
+        global $wpdb; $id=absint($request['id']); $table=$wpdb->prefix.'psc_exams'; if(!$wpdb->get_var($wpdb->prepare("SELECT id FROM {$table} WHERE id=%d",$id))) return new \WP_Error('exam_not_found','Exam not found.',['status'=>404]);
+        $parsed=self::exam_admin_payload($request); if(isset($parsed['error'])) return $parsed['error']; $d=$parsed['data']; $questions=$d['_questions']; unset($d['_questions']); $d['updated_at']=current_time('mysql');
+        $formats=[]; foreach($d as $k=>$v) $formats[]=is_int($v)?'%d':(is_float($v)?'%f':'%s'); if($wpdb->update($table,$d,['id'=>$id],$formats,['%d'])===false) return new \WP_Error('exam_update_failed',$wpdb->last_error?:'Could not update exam.',['status'=>500]);
+        if(!self::sync_exam_questions_admin($id,$questions)) return new \WP_Error('exam_question_sync_failed',$wpdb->last_error?:'Could not save exam questions.',['status'=>500]);
+        return ['success'=>true,'data'=>['id'=>$id],'message'=>'Exam updated successfully.'];
+    }
+
+    public static function delete_exam_api($request){
+        global $wpdb; $id=absint($request['id']); $table=$wpdb->prefix.'psc_exams'; if(!$wpdb->get_var($wpdb->prepare("SELECT id FROM {$table} WHERE id=%d",$id))) return new \WP_Error('exam_not_found','Exam not found.',['status'=>404]);
+        $eq=$wpdb->prefix.'psc_exam_questions'; if($wpdb->delete($eq,['exam_id'=>$id],['%d'])===false) return new \WP_Error('exam_delete_failed',$wpdb->last_error?:'Could not delete exam question links.',['status'=>500]);
+        if($wpdb->delete($table,['id'=>$id],['%d'])===false) return new \WP_Error('exam_delete_failed',$wpdb->last_error?:'Could not delete exam.',['status'=>500]);
+        return ['success'=>true,'data'=>['id'=>$id],'message'=>'Exam deleted successfully.'];
+    }
+
+    public static function bulk_delete_exams_api($request){
+        $body=$request->get_json_params(); $ids=is_array($body)?($body['ids']??$body):[]; $ids=array_values(array_unique(array_filter(array_map('absint',(array)$ids)))); if(!$ids) return new \WP_Error('exam_ids_required','At least one exam ID is required.',['status'=>400]);
+        $deleted=[];$failed=[]; foreach($ids as $id){ $r=self::delete_exam_api(new \WP_REST_Request('DELETE','/psc/v1/exams/'.$id)); if(is_wp_error($r)) $failed[]=['id'=>$id,'error'=>$r->get_error_message()]; else $deleted[]=$id; }
+        return ['success'=>empty($failed),'deleted'=>$deleted,'failed'=>$failed,'deleted_count'=>count($deleted),'failed_count'=>count($failed)];
+    }
 
     public static function submit_exam($request){
         global $wpdb;$uid=get_current_user_id();$exam_id=absint($request['id']);$body=$request->get_json_params();$answers=(array)($body['answers']??[]);$time=max(0,absint($body['time_taken_seconds']??0));$exam=self::exam(['id'=>$exam_id]);if(empty($exam['success']))return new \WP_Error('exam_not_found','Exam not found',['status'=>404]);$e=$exam['data'];
